@@ -10,13 +10,14 @@ import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import messagebox, simpledialog, ttk
 
 import cv2
 import numpy as np
 from PIL import Image, ImageTk
 from engine import ClockReader, CountdownSync, format_time, parse_time
 from autocalibration import AutoCalibration, VisualLocator
+from recordings import RecordingList, read_names, decode, same_title
 
 ROOT = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
 ASSETS = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
@@ -194,14 +195,20 @@ def click(point, event, already_moved=False):
 
 
 NAMES = {"macro": "① 录制开关", "challenge": "② 挑战", "start": "③ 开始／确定", "timer": "④ 计时器中心"}
+LEGACY_TIME_PRESET_NAME = '佩恩5926~5940，火影手游i敏：59。2秒开'
+TIME_DEFAULTS = dict(target='04:59:15', offset='0', delay='1800', width='160', height='54', mode='full', dry=False)
+EXTRA_TIME_PRESETS = [
+    ('jasmine5940', dict(TIME_DEFAULTS, name='茉莉5940  录制文件在茉莉群  mumu分辨率1270*720', target='04:59:02', width='168', height='54')),
+    ('imin5926', dict(TIME_DEFAULTS, name='i敏稳定5926  分享码ADK1YZ  mumu分辨率1600*900', target='04:59:15', width='163', height='51')),
+]
 
 
 class App:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("豚豚护送 · 定时点击助手 v1.2")
-        self.root.geometry("720x760")
-        self.root.minsize(700, 720)
+        self.root.title("豚豚护送 · 定时点击助手 v1.3")
+        self.root.geometry("720x820")
+        self.root.minsize(700, 800)
         self.events = queue.Queue()
         self.stop = threading.Event()
         self.busy = False
@@ -217,7 +224,20 @@ class App:
             self.points = {k: tuple(v) for k, v in self.config.get("points", {}).items()}
         except (OSError, ValueError, TypeError):
             pass
+        self.load_time_presets()
         self.make_ui()
+        self.apply_time_preset()
+        self.recordings = self.config.get('recordings', [])
+        try:
+            for record in self.recordings:
+                if not isinstance(record['name'],str) or decode(record['image']) is None:
+                    raise ValueError('invalid recording')
+        except (ValueError,TypeError,KeyError):
+            self.recordings = []
+            self.config.pop('selected_recording',None)
+        self.update_recordings(self.recordings, persist=False)
+        if self._preset_import_notice:
+            self.say(self._preset_import_notice)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.after(20, self.poll)
 
@@ -228,7 +248,7 @@ class App:
         style.configure("TButton", font=("Microsoft YaHei UI", 10), padding=5)
         outer = ttk.Frame(self.root, padding=16)
         outer.pack(fill="both", expand=True)
-        ttk.Label(outer, text="豚豚护送 · 定时点击 v1.2", font=("Microsoft YaHei UI", 18, "bold")).pack(anchor="w")
+        ttk.Label(outer, text="豚豚护送 · 定时点击 v1.3", font=("Microsoft YaHei UI", 18, "bold")).pack(anchor="w")
         footer = ttk.Frame(outer)
         footer.pack(side="bottom", fill="x", pady=(8, 0))
         footer.columnconfigure(0, weight=1, uniform="footer_side")
@@ -251,7 +271,15 @@ class App:
         self.auto_button = ttk.Button(auto_actions, text="一键自动校准 → 进入游戏 → 暂停", command=self.auto_calibrate)
         self.auto_button.pack(side="left", fill="x", expand=True)
         ttk.Button(auto_actions, text="查看箭头定位", command=self.show_macro_preview).pack(side="left", padx=(8,0))
-        ttk.Label(auto, text="先打开活动页和操作录制列表，列表滚到顶部，录制处于停止状态。\n会用当前已选角色进入一局，可能消耗挑战次数；完成后点击暂停。\n最上面一行的录制开关只记录位置，不会启动。F9 可中止。", wraplength=640).pack(anchor="w", pady=(6, 0))
+        ttk.Label(auto, text="先打开活动页和操作录制列表，列表滚到顶部，停止所有录制。\n会用当前角色进入一局，可能消耗次数；暂停后滚动识别录制名称。\n默认选择第一项，可在下方改选；扫描和选择均不会启动录制。", wraplength=640).pack(anchor="w", pady=(6, 0))
+        choose_row = ttk.Frame(auto)
+        choose_row.pack(fill='x', pady=(8,0))
+        ttk.Label(choose_row, text='使用录制：').pack(side='left')
+        self.recording_choice = ttk.Combobox(choose_row, state='readonly', width=39)
+        self.recording_choice.pack(side='left', fill='x', expand=True)
+        self.recording_choice.bind('<<ComboboxSelected>>', self.choose_recording)
+        self.refresh_button = ttk.Button(choose_row, text='刷新录制列表', command=self.refresh_recordings)
+        self.refresh_button.pack(side='left', padx=(6,0))
         group = ttk.LabelFrame(prep_tab, text="手动校准（备用）· 只记录位置，不会点击", padding=10)
         group.pack(fill="x")
         ttk.Label(group, text="点击下方校准按钮，移到目标中央后按 F6。调整窗口后需重新校准。", wraplength=600).pack(anchor="w")
@@ -266,7 +294,21 @@ class App:
             label = ttk.Label(row, text=self.point_text(key))
             label.pack(side="left", padx=10)
             self.point_labels[key] = label
-        ttk.Label(group, text="① 默认使用列表最上面一行的蓝色播放按钮，也可手动指定其他行。\n③ 视频里对应选人界面的“确定”，请先选好角色。", wraplength=640).pack(anchor="w", pady=(5, 0))
+        ttk.Label(group, text="① 可从上方选择录制；手动校准①后改用手动位置。\n③ 视频里对应选人界面的“确定”，请先选好角色。", wraplength=640).pack(anchor="w", pady=(5, 0))
+        preset_group = ttk.LabelFrame(run_tab, text='使用时间', padding=10)
+        preset_group.pack(fill='x', pady=(0,8))
+        self.time_choice = ttk.Combobox(preset_group, state='readonly', width=50)
+        self.time_choice.pack(fill='x')
+        self.time_choice.bind('<<ComboboxSelected>>', self.choose_time_preset)
+        preset_actions = ttk.Frame(preset_group)
+        preset_actions.pack(fill='x', pady=(6,0))
+        self.new_time_button = ttk.Button(preset_actions, text='新建', command=self.new_time_preset)
+        self.delete_time_button = ttk.Button(preset_actions, text='删除', command=self.delete_time_preset)
+        self.rename_time_button = ttk.Button(preset_actions, text='重命名', command=self.rename_time_preset)
+        for button in (self.new_time_button,self.delete_time_button,self.rename_time_button):
+            button.pack(side='left',padx=(0,6))
+        self.time_count = ttk.Label(preset_actions)
+        self.time_count.pack(side='right')
         opts = ttk.LabelFrame(run_tab, text="触发设置", padding=10)
         opts.pack(fill="x", pady=(0, 6))
         self.target = tk.StringVar(value=str(self.config.get("target", "04:59:15")))
@@ -277,12 +319,30 @@ class App:
         self.mode = tk.StringVar(value=self.config.get("mode", "full"))
         self.dry = tk.BooleanVar(value=False)
         for i, (label, variable, tip) in enumerate([
-            ("目标倒计时", self.target, "分:秒:百分之一秒，如 04:59:15"),
+            ("目标倒计时", self.target, "分 : 秒 : 百分之一秒"),
             ("时间微调（毫秒）", self.offset, "负数提前，正数延后；0 = 不调整"),
             ("挑战→开始间隔（毫秒）", self.delay, "等待选人界面出现，默认 1800"),
         ]):
             ttk.Label(opts, text=label).grid(row=i, column=0, sticky="w", pady=4)
-            ttk.Entry(opts, textvariable=variable, width=13).grid(row=i, column=1, padx=10)
+            if variable is self.target:
+                time_fields = ttk.Frame(opts)
+                time_fields.grid(row=i, column=1, padx=10, sticky='w')
+                self.target_parts = [tk.StringVar() for _ in range(3)]
+                self.target_entries = []
+                self._target_sync = False
+                validate = (self.root.register(lambda value,action: action=='-1' or value=='' or (len(value)<=2 and value.isascii() and value.isdigit())), '%P', '%d')
+                for part, value in enumerate(self.target_parts):
+                    if part:
+                        ttk.Label(time_fields,text=':').pack(side='left',padx=2)
+                    entry = ttk.Entry(time_fields,textvariable=value,width=3,justify='center',validate='key',validatecommand=validate)
+                    entry.pack(side='left')
+                    entry.bind('<FocusOut>',lambda event,v=value: v.set(v.get().zfill(2)) if v.get().isdigit() else None)
+                    self.target_entries.append(entry)
+                    value.trace_add('write',self.target_parts_changed)
+                self.target.trace_add('write',self.target_text_changed)
+                self.target_text_changed()
+            else:
+                ttk.Entry(opts, textvariable=variable, width=13).grid(row=i, column=1, padx=10)
             ttk.Label(opts, text=tip).grid(row=i, column=2, sticky="w")
         ttk.Label(opts, text="识别框宽 × 高（像素）").grid(row=3, column=0, sticky="w", pady=4)
         size = ttk.Frame(opts)
@@ -306,6 +366,27 @@ class App:
         self.log = tk.Text(outer, height=5, font=("Microsoft YaHei UI", 9), state="disabled", wrap="word")
         self.log.pack(fill="both", expand=True)
 
+    def target_text_changed(self, *unused):
+        if self._target_sync:
+            return
+        self._target_sync = True
+        try:
+            parts = self.target.get().strip().replace('：',':').replace('.',':').split(':')
+            for index, variable in enumerate(self.target_parts):
+                variable.set(parts[index] if index<len(parts) else '')
+        finally:
+            self._target_sync = False
+
+    def target_parts_changed(self, *unused):
+        if self._target_sync:
+            return
+        self._target_sync = True
+        try:
+            parts = [v.get() for v in self.target_parts]
+            self.target.set(':'.join(v.zfill(2) if v else '' for v in parts) if any(parts) else '')
+        finally:
+            self._target_sync = False
+
     def point_text(self, key):
         return f"已记录 {self.points[key]}" if key in self.points else "尚未校准"
 
@@ -317,6 +398,7 @@ class App:
         self.log.configure(state="disabled")
 
     def save(self):
+        self.store_time_preset()
         self.config.update(points=self.points, target=self.target.get(), offset=self.offset.get(),
                            delay=self.delay.get(), width=self.width.get(), height=self.height.get(), mode=self.mode.get())
         try:
@@ -324,12 +406,212 @@ class App:
         except OSError as error:
             self.say(f"设置无法保存：{error}")
 
+    def load_time_presets(self):
+        saved = self.config.get('time_presets')
+        self.time_presets = []
+        if isinstance(saved,list):
+            for item in saved[:10]:
+                if isinstance(item,dict) and isinstance(item.get('name'),str) and item['name'].strip():
+                    self.time_presets.append(dict(name=item['name'], **{k:item.get(k,v) for k,v in TIME_DEFAULTS.items()}))
+        selected = self.config.get('selected_time_preset',0)
+        previous = self.time_presets[selected] if isinstance(selected,int) and 0<=selected<len(self.time_presets) else None
+        if not self.config.get('removed_legacy_time_preset'):
+            self.time_presets = [item for item in self.time_presets if item['name'].strip()!=LEGACY_TIME_PRESET_NAME]
+            self.config['removed_legacy_time_preset'] = True
+        if not self.time_presets:
+            self.time_presets = [dict(preset) for _,preset in EXTRA_TIME_PRESETS]
+        # Import each bundled addition once, preserving user edits, deletions and selection.
+        imported = self.config.get('imported_time_presets', [])
+        imported = set(item for item in imported if isinstance(item,str)) if isinstance(imported,list) else set()
+        skipped = 0
+        for identity, preset in EXTRA_TIME_PRESETS:
+            if identity in imported:
+                continue
+            name = ' '.join(preset['name'].split())
+            if any(' '.join(item['name'].split()) == name for item in self.time_presets):
+                imported.add(identity)
+            elif len(self.time_presets) < 10:
+                self.time_presets.append(dict(preset))
+                imported.add(identity)
+            else:
+                skipped += 1
+        self.config['imported_time_presets'] = sorted(imported)
+        self._preset_import_notice = f'时间预设已达 10 个，另有 {skipped} 个新增预设未加入；删除不需要的预设后，重启程序即可补充。' if skipped else ''
+        self.time_index = next((i for i,item in enumerate(self.time_presets) if item is previous),0)
+        self._preset_control_state = None
+
+    def store_time_preset(self):
+        self.time_presets[self.time_index].update({key:getattr(self,key).get() for key in TIME_DEFAULTS})
+        self.config['time_presets'] = self.time_presets
+        self.config['selected_time_preset'] = self.time_index
+
+    def apply_time_preset(self):
+        preset = self.time_presets[self.time_index]
+        for key in TIME_DEFAULTS:
+            getattr(self,key).set(preset[key])
+        self.time_choice.configure(values=[f'{i+1}. {item["name"]}' for i,item in enumerate(self.time_presets)])
+        self.time_choice.current(self.time_index)
+        self.time_count.configure(text=f'{len(self.time_presets)} / 10 个预设')
+        self.update_time_controls()
+
+    def update_time_controls(self):
+        state = (self.busy, len(self.time_presets))
+        if state == self._preset_control_state:
+            return
+        self._preset_control_state = state
+        self.time_choice.configure(state='disabled' if self.busy else 'readonly')
+        self.new_time_button.configure(state='disabled' if self.busy or len(self.time_presets)>=10 else 'normal')
+        self.delete_time_button.configure(state='disabled' if self.busy or len(self.time_presets)<=1 else 'normal')
+        self.rename_time_button.configure(state='disabled' if self.busy else 'normal')
+
+    def choose_time_preset(self, event=None):
+        index = self.time_choice.current()
+        if self.busy or not 0<=index<len(self.time_presets):
+            self.time_choice.current(self.time_index)
+            return
+        self.store_time_preset()
+        self.time_index = index
+        self.apply_time_preset()
+        self.save()
+        self.say(f'已使用时间预设：{self.time_presets[index]["name"]}')
+
+    def new_time_preset(self):
+        if self.busy or len(self.time_presets)>=10:
+            return
+        self.store_time_preset()
+        number = 2
+        names = {p['name'] for p in self.time_presets}
+        while f'预设{number}' in names:
+            number += 1
+        # Copy preset 1, including its latest edits, but leave only target blank.
+        self.time_presets.append(dict(self.time_presets[0], name=f'预设{number}',target=''))
+        self.time_index = len(self.time_presets)-1
+        self.apply_time_preset()
+        self.save()
+        self.say('已新建时间预设：请填写目标倒计时，其余设置已复制预设1。')
+
+    def delete_time_preset(self):
+        if self.busy or len(self.time_presets)<=1:
+            return
+        removed = self.time_presets.pop(self.time_index)
+        self.time_index = min(self.time_index,len(self.time_presets)-1)
+        self.apply_time_preset()
+        self.save()
+        self.say(f'已删除时间预设：{removed["name"]}')
+
+    def rename_time_preset(self):
+        if self.busy:
+            return
+        preset = self.time_presets[self.time_index]
+        name = simpledialog.askstring('重命名时间预设','请输入预设名称：',initialvalue=preset['name'],parent=self.root)
+        if name is None:
+            return
+        name = name.strip()
+        if not name or any(i!=self.time_index and p['name']==name for i,p in enumerate(self.time_presets)):
+            messagebox.showerror('检查名称','名称不能为空，也不能与其他时间预设重复。',parent=self.root)
+            return
+        self.store_time_preset()
+        preset['name'] = name
+        self.apply_time_preset()
+        self.save()
+        self.say(f'时间预设已重命名为：{name}')
+
     def calibrate(self, key):
         if self.busy:
             return
         self.pending = key
         self.say(f"请把鼠标移到{NAMES[key]}中央，按 F6 记录；F9 取消。")
         self.root.iconify()
+
+    def selected_recording(self):
+        index = self.config.get('selected_recording')
+        return self.recordings[index] if isinstance(index,int) and 0 <= index < len(self.recordings) else None
+
+    def update_recordings(self, records, persist=True):
+        previous = self.selected_recording() if hasattr(self,'recordings') else None
+        self.recordings = records
+        self.config['recordings'] = records
+        self.recording_choice.configure(values=[f'{i+1}. {r["name"]}' for i,r in enumerate(records)])
+        index = next((i for i,r in enumerate(records) if previous and same_title(decode(r['image']),decode(previous['image']))), 0)
+        if records and (persist or self.config.get('selected_recording') is not None):
+            self.config['selected_recording'] = index
+            self.recording_choice.current(index)
+            self.point_labels['macro'].configure(text='执行前按所选录制重新定位')
+        else:
+            self.config.pop('selected_recording',None)
+            self.recording_choice.set('手动位置' if 'macro' in self.points else '请先自动校准或刷新列表')
+        if persist:
+            self.macro_preview = None
+            self.save()
+            self.say(f'已识别 {len(records)} 项录制，可从“使用录制”中选择；名称以原始截图为准。')
+
+    def choose_recording(self, event=None):
+        if self.busy:
+            return
+        index = self.recording_choice.current()
+        if not 0 <= index < len(self.recordings):
+            return
+        self.config['selected_recording'] = index
+        self.macro_preview = None
+        self.point_labels['macro'].configure(text='执行前按所选录制重新定位')
+        self.save()
+        self.say(f'已选择：{self.selected_recording()["name"]}。执行前自动找到该行蓝色箭头。')
+
+    def recording_service(self, cap, sx, sy):
+        window = recording_window_rect()
+        if not window:
+            raise RuntimeError('请打开 MuMu 操作录制窗口')
+        region = tuple(v-(sx if i%2==0 else sy) for i,v in enumerate(window))
+        def check():
+            check_stop(self.stop)
+        def wait(seconds):
+            self.stop.wait(seconds)
+            check()
+        def scroll(delta):
+            check()
+            if recording_window_rect() != window:
+                raise RuntimeError('录制窗口位置已变化，请重新校准')
+            x,y,r,b = window
+            move_to((round(x+(r-x)*.35), round(y+(b-y)*.55)),self.stop)
+            packet = INPUT(type=0, u=INPUTUNION(mi=MOUSEINPUT(0,0,delta & 0xffffffff,0x0800,0,0)))
+            if USER32.SendInput(1,C.byref(packet),C.sizeof(INPUT)) != 1:
+                raise RuntimeError('无法滚动录制列表，请检查权限')
+        locator = VisualLocator(ASSETS/'calibration.npz',check,region)
+        return RecordingList(locator,cap.grab,scroll,wait,check,self.post,
+                             lambda images: read_names(images,ASSETS/'recording_ocr.ps1',check))
+
+    def refresh_recordings(self):
+        if self.busy or self.pending:
+            return
+        self.stop.clear()
+        self.busy = True
+        self.recording_choice.configure(state='disabled')
+        self.refresh_button.configure(state='disabled')
+        self.run_button.configure(state='disabled')
+        self.auto_button.configure(state='disabled')
+        for button in self.cal_buttons:
+            button.configure(state='disabled')
+        self.say('3 秒后滚动识别所有录制名称，不会进入游戏或启动录制。F9 可停止。')
+        self.root.iconify()
+        threading.Thread(target=self.recordings_worker,daemon=True).start()
+
+    def recordings_worker(self):
+        cap = None
+        try:
+            wait_until(time.perf_counter()+3,self.stop)
+            sx,sy,sw,sh = screen_rect()
+            cap = ScreenCapture((sx,sy,sw,sh))
+            records = self.recording_service(cap,sx,sy).scan()
+            check_stop(self.stop)
+            self.events.put(('recordings',records))
+        except Cancelled:
+            self.post('录制列表识别已停止，原选择保留。')
+        except Exception as error:
+            self.post(f'录制列表识别失败：{error}。原选择保留。')
+        finally:
+            if cap:
+                cap.close()
+            self.events.put(('auto_done',None))
 
     def auto_calibrate(self):
         if self.busy or self.pending:
@@ -339,6 +621,8 @@ class App:
             return
         self.stop.clear()
         self.busy = True
+        self.recording_choice.configure(state='disabled')
+        self.refresh_button.configure(state='disabled')
         self.run_button.configure(state="disabled")
         self.auto_button.configure(state="disabled")
         for button in self.cal_buttons:
@@ -376,6 +660,14 @@ class App:
             check()
             result["points"] = {k: (p[0]+sx, p[1]+sy) for k, p in result["points"].items()}
             self.events.put(("calibrated", result))
+            self.post('游戏位置校准完成；开始滚动识别操作录制名称。')
+            try:
+                records = self.recording_service(cap,sx,sy).scan()
+                self.events.put(('recordings',records))
+            except Cancelled:
+                self.post('名称识别已取消；游戏位置已保存。可稍后刷新录制列表。')
+            except Exception as error:
+                self.post(f'游戏位置已保存，但名称识别失败：{error}。可稍后刷新录制列表。')
         except Cancelled:
             self.post("自动校准已停止，旧位置保留。若已经进入游戏，请手动暂停。")
         except Exception as e:
@@ -388,18 +680,22 @@ class App:
     def show_macro_preview(self):
         if self.busy:
             return
-        if self.macro_preview is None:
+        record = self.selected_recording()
+        if self.macro_preview is None and not record:
             messagebox.showinfo("箭头定位", "自动校准识别到箭头后，这里会显示实际截图与绿色定位框。", parent=self.root)
             return
         win = tk.Toplevel(self.root)
-        win.title("录制开关 · 第一行蓝色播放箭头")
-        im = Image.fromarray(cv2.cvtColor(self.macro_preview, cv2.COLOR_BGR2RGB))
-        im = im.resize((im.width*3, im.height*3))
+        win.title("所选录制 · 名称原图与箭头定位")
+        source = decode(record['image']) if record else self.macro_preview
+        im = Image.fromarray(cv2.cvtColor(source, cv2.COLOR_BGR2RGB))
+        im = im.resize((im.width*2, im.height*2))
+        im.thumbnail((850,250))
         photo = ImageTk.PhotoImage(im)
         label = ttk.Label(win, image=photo)
         label.image = photo
         label.pack(padx=16,pady=16)
-        ttk.Label(win,text="绿色框内为实际识别的播放箭头，点击位置在框中心。\n如需第二行或其他录制，请使用手动校准①。",wraplength=500).pack(padx=16,pady=(0,16))
+        text = '所选录制的名称原始截图。执行前重新定位该行的蓝色播放箭头。\n文字识别可能有误；被省略的长名称请在模拟器中核对。' if record else '绿色框内为识别到的蓝色播放箭头，点击位置在框中心。'
+        ttk.Label(win,text=text,wraplength=700).pack(padx=16,pady=(0,16))
 
     def collect_point(self):
         if self.pending is None:
@@ -409,6 +705,10 @@ class App:
             return
         key, self.pending = self.pending, None
         self.points[key] = (p.x, p.y)
+        if key == 'macro':
+            self.config.pop('selected_recording',None)
+            self.recording_choice.set('手动位置')
+            self.macro_preview = None
         self.config.pop("auto_scale", None)
         self.point_labels[key].configure(text=self.point_text(key))
         self.save()
@@ -467,9 +767,11 @@ class App:
             return
         try:
             dry = self.dry.get()
+            if not all(v.get().strip() for v in self.target_parts):
+                raise ValueError('请完整填写目标倒计时的三个小框：分、秒、百分之一秒')
             full = self.mode.get() == "full" and not dry
             needed = ["timer"] + ([] if dry else ["macro"]) + (["challenge", "start"] if full else [])
-            missing = [NAMES[k] for k in needed if k not in self.points]
+            missing = [NAMES[k] for k in needed if k not in self.points and not (k=='macro' and self.selected_recording())]
             if missing:
                 raise ValueError("请先校准：" + "、".join(missing))
             target = parse_time(self.target.get())
@@ -483,13 +785,15 @@ class App:
             if not .01 <= effective <= 299.8:
                 raise ValueError("微调后的实际触发时间须在 00:00:01～04:59:80，留出对时所需时间")
             cfg = dict(target=target, offset=offset, delay=delay, dry=dry, full=full,
-                       roi=self.roi(), points=dict(self.points), auto_scale=self.config.get("auto_scale"))
+                       roi=self.roi(), points=dict(self.points), auto_scale=self.config.get("auto_scale"), recording=self.selected_recording())
         except (ValueError, KeyError) as e:
             messagebox.showerror("检查设置", str(e), parent=self.root)
             return
         self.save()
         self.stop.clear()
         self.busy = True
+        self.recording_choice.configure(state='disabled')
+        self.refresh_button.configure(state='disabled')
         self.run_button.configure(state="disabled")
         self.auto_button.configure(state="disabled")
         for button in self.cal_buttons:
@@ -523,6 +827,15 @@ class App:
         WINMM.timeBeginPeriod(1)
         try:
             wait_until(time.perf_counter()+3, self.stop)
+            if cfg.get('recording') and not cfg['dry']:
+                self.post(f'正在定位所选录制：{cfg["recording"]["name"]}。请等待提示后再手动开局。')
+                sx,sy,sw,sh = screen_rect()
+                cap = ScreenCapture((sx,sy,sw,sh))
+                match = self.recording_service(cap,sx,sy).locate(cfg['recording'])
+                cfg['points']['macro'] = (match.center[0]+sx,match.center[1]+sy)
+                cap.close()
+                cap = None
+                self.post('所选录制已定位。')
             if cfg["full"]:
                 if cfg.get("auto_scale"):
                     self.verify_auto_button(cfg, "challenge")
@@ -570,6 +883,7 @@ class App:
                                   effective_target=format_time(cfg["target"]-cfg["offset"]/1000),
                                   last_reading=format_time(latest_value),
                                   scheduler_error_ms=round((sent-deadline)*1000, 3),
+                                  recording=cfg.get('recording',{}).get('name') if cfg.get('recording') else None,
                                   note="调度误差不等于游戏内实际误差；游戏受理结果未验证")
                     try:
                         with (ROOT / "runs.jsonl").open("a", encoding="utf-8") as f:
@@ -616,9 +930,10 @@ class App:
             self.say("已取消校准")
 
     def poll(self):
+        self.update_time_controls()
         for key, action in [(0x75, self.collect_point), (0x77, self.start), (0x78, self.cancel)]:
             down = bool(USER32.GetAsyncKeyState(key) & 0x8000)
-            if down and not self.keys.get(key, False):
+            if down and not self.keys.get(key, False) and self.root.grab_current() is None:
                 action()
             self.keys[key] = down
         try:
@@ -628,6 +943,8 @@ class App:
                     self.say(value)
                 elif kind == "macro_preview":
                     self.macro_preview = value
+                elif kind == 'recordings':
+                    self.update_recordings(value)
                 elif kind == "calibrated":
                     self.points.update(value["points"])
                     self.config["auto_scale"] = value["scale"]
@@ -635,6 +952,8 @@ class App:
                     self.height.set(str(value["height"]))
                     for key, label in self.point_labels.items():
                         label.configure(text=self.point_text(key))
+                    if self.selected_recording():
+                        self.point_labels['macro'].configure(text='执行前按所选录制重新定位')
                     self.save()
                     if value["paused"]:
                         self.say("自动校准完成并已检测到暂停。正式执行前请手动返回活动页，再按 F8。")
@@ -644,6 +963,8 @@ class App:
                     self.busy = False
                     self.run_button.configure(state="normal")
                     self.auto_button.configure(state="normal")
+                    self.recording_choice.configure(state='readonly')
+                    self.refresh_button.configure(state='normal')
                     for button in self.cal_buttons:
                         button.configure(state="normal")
                     if kind == "auto_done" and not self.closing:
@@ -667,14 +988,21 @@ def main():
     except (AttributeError, OSError):
         USER32.SetProcessDPIAware()
     cv2.setNumThreads(1)
-    if len(sys.argv) == 3 and sys.argv[1] == "--self-test":
+    if len(sys.argv) in (3,4) and sys.argv[1] == "--self-test":
         # Packaging smoke test: initialize widgets/assets without sending input.
         app = App()
         app.root.withdraw()
         app.root.update_idletasks()
         visual = VisualLocator(ASSETS / "calibration.npz")
         report = dict(ok=True, templates=len(app.reader.labels), calibration_assets=list(visual.assets), input_size=C.sizeof(INPUT),
+                      recording_ocr=(ASSETS/'recording_ocr.ps1').is_file(), recording_picker=bool(app.recording_choice),
+                      time_preset_picker=bool(app.time_choice), time_preset_count=len(app.time_presets),
                       tkinter=str(tk.TkVersion), opencv=cv2.__version__, numpy=np.__version__)
+        if len(sys.argv)==4 and sys.argv[3]=='--ocr':
+            sample = np.full((30,250,3),50,np.uint8)
+            cv2.putText(sample,'Test5912',(8,23),cv2.FONT_HERSHEY_SIMPLEX,.65,(240,240,240),1,cv2.LINE_AA)
+            report['ocr_test'] = read_names([sample],ASSETS/'recording_ocr.ps1')
+            report['ok'] = report['ok'] and '5912' in report['ocr_test'][0]
         Path(sys.argv[2]).write_text(json.dumps(report), encoding="utf-8")
         app.root.destroy()
         return

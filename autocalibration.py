@@ -91,6 +91,50 @@ class VisualLocator:
             x, y, r, b = panel.box
             s = panel.scale
             region = (r-48*s, b+3*s, r, b+34*s)
+        return self._macro_in_region(frame, region, s)
+
+    def macro_rows(self, frame):
+        """Return fully visible playable rows; never treat a stop square as play."""
+        if self.recording_region is None:
+            raise RuntimeError('请打开 MuMu 操作录制窗口，再识别录制名称')
+        x, y, r, b = self.recording_region
+        s = (r-x)/400
+        image, (ox, oy) = crop(frame, (r-65*s, y+25*s, r-4*s, b-4*s))
+        if not image.size:
+            return []
+        blue, green, red = cv2.split(image.astype(np.int16))
+        mask = ((blue>150)&(green>90)&(red<120)&(green-red>70)&(blue-red>100)).astype(np.uint8)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        rows = []
+        for contour in contours:
+            bx, by, bw, bh = cv2.boundingRect(contour)
+            if not (12*s <= bw <= 29*s and 7*s <= bh <= 21*s and 1.3 <= bw/bh <= 2.3):
+                continue
+            cy = oy+by+bh/2
+            if cy-13*s < y+24*s or cy+12*s > b-3*s:
+                continue
+            match = self._macro_in_region(frame, (ox+bx-3*s, oy+by-3*s, ox+bx+bw+3*s, oy+by+bh+3*s), s)
+            if match:
+                title, _ = crop(frame, (x+12*s, cy-13*s, r-190*s, cy+2*s))
+                rows.append((match, title.copy()))
+        return sorted(rows, key=lambda row: row[0].center[1])
+
+    def scrollbar(self, frame):
+        """Visible MuMu scrollbar thumb, used to reject ineffective scrolling."""
+        if not self.recording_region:
+            return None
+        x,y,r,b = self.recording_region
+        s = (r-x)/400
+        strip, (_,oy) = crop(frame,(r-5*s,y+25*s,r-3*s,b-3*s))
+        if not strip.size:
+            return None
+        pixels = np.median(strip,axis=1)
+        neutral = (pixels.max(axis=1)-pixels.min(axis=1)<12) & (pixels.mean(axis=1)>75) & (pixels.mean(axis=1)<150)
+        edges = np.diff(np.r_[False,neutral,False].astype(int))
+        runs = [(a+oy,z+oy) for a,z in zip(np.where(edges==1)[0],np.where(edges==-1)[0]) if z-a>12*s]
+        return (*max(runs,key=lambda p:p[1]-p[0]),y+32*s,b-8*s,s) if runs else None
+
+    def _macro_in_region(self, frame, region, s):
         # Require the blue button AND its white right-pointing triangle.
         # A stopped/missing first row never falls back to a lower row.
         image, (ox, oy) = crop(frame, region)
